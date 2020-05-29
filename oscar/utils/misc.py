@@ -7,6 +7,8 @@ import yaml
 import random
 import torch
 import numpy as np
+import base64
+import cv2
 
 
 def mkdir(path):
@@ -44,3 +46,12 @@ def find_file_path_in_yaml(fname, root):
                 errno.ENOENT, os.strerror(errno.ENOENT), op.join(root, fname)
             )
 
+
+def img_from_base64(imagestring):
+    try:
+        jpgbytestring = base64.b64decode(imagestring)
+        nparr = np.frombuffer(jpgbytestring, np.uint8)
+        r = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        return r
+    except ValueError:
+        return None

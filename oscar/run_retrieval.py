@@ -11,11 +11,16 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, RandomSampler, SequentialSampler
 from tqdm import tqdm
 
+import base64
+from PIL import Image
+import cv2
+
 from oscar.utils.logger import setup_logger
-from oscar.utils.misc import mkdir, set_seed
+from oscar.utils.misc import mkdir, set_seed, img_from_base64
 from oscar.modeling.modeling_bert import ImageBertForSequenceClassification
 from transformers.pytorch_transformers import BertTokenizer, BertConfig 
 from transformers.pytorch_transformers import AdamW, WarmupLinearSchedule, WarmupConstantSchedule
+from oscar.utils.tsv_file import TSVFile
 
 
 class RetrievalDataset(Dataset):
@@ -31,19 +36,46 @@ class RetrievalDataset(Dataset):
 
         """
         super(RetrievalDataset, self).__init__()
-        feature_file = op.join(args.data_dir, '{}_img_{}_feats.pt'.format(split, args.img_feature_type))
+        self.bbox_as_input = args.bbox_as_input
+        # feature_file = op.join(args.data_dir, '{}_img_{}_feats.pt'.format(split, args.img_feature_type))
+        feature_file = "/home/penzhan/GitHub/vqa_txt_model/data/panderson_nmfilter2_thres0.2_imsperbatch1_tsv/featuresC.tsv"
         caption_file = op.join(args.data_dir, '{}_captions.pt'.format(split))
-        self.features = torch.load(feature_file)
+        self.img_tsv = TSVFile(feature_file)
+        self.hw_tsv = TSVFile("/home/penzhan/GitHub/vqa_txt_model/data/coco/images.hw.tsv")
         self.captions = torch.load(caption_file)
-        self.img_keys = list(self.features.keys())
+        self.img_keys = list(self.captions.keys()) # img_id as int
         if not type(self.captions[self.img_keys[0]]) == list:
             self.captions = {k: json.loads(self.captions[k]) for k in self.img_keys}
-        assert len(self.features) == len(self.captions), \
-               "the length of image features and captions does not match!"
+
+        # get the image image_id to index map
+        self.image_id2idx = {} # img_id as string
+        if self.bbox_as_input:
+            for line_no in range(self.hw_tsv.num_rows()):
+                image_id = self.hw_tsv.seek(line_no)[0]
+                self.image_id2idx[image_id] = line_no
+            self.hw_tsv._fp.close()
+            self.hw_tsv._fp = None
+        else:
+            # get the 'imageid2idx.json' in the feature folder
+            imgid2idx_file = "/home/penzhan/GitHub/vqa_txt_model/data/panderson_nmfilter2_thres0.2_imsperbatch1_tsv/imageid2idx.json"
+            self.image_id2idx = json.load(open(imgid2idx_file))
         
         if args.add_od_labels:
-            label_file = op.join(args.data_dir, '{}_{}_labels.pt'.format(split, args.od_label_type))
-            self.labels = torch.load(label_file)
+            # label_file = op.join(args.data_dir, '{}_{}_labels.pt'.format(split, args.od_label_type))
+            label_file = "/home/penzhan/GitHub/vqa_txt_model/data/panderson_nmfilter2_thres0.2_imsperbatch1_tsv/predictions.tsv"
+            self.label_tsv = TSVFile(label_file)
+            self.labels = {}
+            for line_no in range(self.label_tsv.num_rows()):
+                row = self.label_tsv.seek(line_no)
+                image_id = row[0]
+                if int(image_id) in self.img_keys:
+                    results = json.loads(row[1])
+                    objects = results['objects']
+                    self.labels[int(image_id)] = {
+                        "image_h": results["image_h"], "image_w": results["image_w"],
+                        "class": [cur_d['class'] for cur_d in objects],
+                        "boxes": np.array([cur_d['rect'] for cur_d in objects], dtype=np.float32)
+                    }
 
         if is_train:
             self.num_captions_per_img = args.num_captions_per_img_train
@@ -55,7 +87,6 @@ class RetrievalDataset(Dataset):
                 with open(op.join(args.data_dir, args.eval_img_keys_file), 'r') as f:
                     img_keys = f.readlines()
                 self.img_keys = [int(k.strip()) for k in img_keys]
-                self.features = {k: self.features[k] for k in self.img_keys}
                 self.captions = {k: self.captions[k] for k in self.img_keys}
                 if args.add_od_labels:
                     self.labels = {k: self.labels[k] for k in self.img_keys}
@@ -179,7 +210,7 @@ class RetrievalDataset(Dataset):
         if self.is_train:
             img_idx, cap_idxs = self.get_image_caption_index(index)
             img_key = self.img_keys[img_idx]
-            feature = self.features[img_key]
+            feature = self.get_image(img_key)
             caption = self.captions[cap_idxs[0]][cap_idxs[1]]
             od_labels = self.get_od_labels(img_key)
             example = self.tensorize_example(caption, feature, text_b=od_labels)
@@ -194,7 +225,7 @@ class RetrievalDataset(Dataset):
                 example_neg = self.tensorize_example(caption_neg, feature, text_b=od_labels)
             else:
                 # randomly select a negative image 
-                feature_neg = self.features[self.img_keys[img_idx_neg]]
+                feature_neg = self.get_image(self.img_keys[img_idx_neg])
                 od_labels_neg = self.get_od_labels(self.img_keys[img_idx_neg])
                 example_neg = self.tensorize_example(caption, feature_neg, text_b=od_labels_neg)
 
@@ -203,7 +234,7 @@ class RetrievalDataset(Dataset):
         else:
             img_idx, cap_idxs = self.get_image_caption_index(index)
             img_key = self.img_keys[img_idx]
-            feature = self.features[img_key]
+            feature = self.get_image(img_key)
             caption = self.captions[cap_idxs[0]][cap_idxs[1]]
             od_labels = self.get_od_labels(img_key)
             example = self.tensorize_example(caption, feature, text_b=od_labels)
@@ -214,6 +245,27 @@ class RetrievalDataset(Dataset):
         if not self.is_train and self.args.cross_image_eval:
             return len(self.img_keys) ** 2 * self.num_captions_per_img
         return len(self.img_keys) * self.num_captions_per_img
+
+    def get_image(self, image_id):
+        image_idx = self.image_id2idx[str(image_id)]
+        row = self.img_tsv.seek(image_idx)
+        if not self.bbox_as_input:
+            # In this case the function returns an array of
+            # features instead of an image
+            num_boxes = int(row[1])
+            features = np.frombuffer(base64.b64decode(row[-1]),
+                                 dtype=np.float32).reshape((num_boxes, -1))
+            t_features = torch.from_numpy(features)
+            return t_features
+        else:
+            # use -1 to support old format with multiple columns.
+            cv2_im = img_from_base64(row[-1])
+            if self.cv2_output:
+                return cv2_im.astype(np.float32, copy=True)
+            cv2_im = cv2.cvtColor(cv2_im, cv2.COLOR_BGR2RGB)
+            # convert to PIL Image as required by transforms
+            img = Image.fromarray(cv2_im)
+            return img
 
 
 def compute_score_with_logits(logits, labels):
@@ -545,6 +597,11 @@ def main():
                         help="Model directory for evaluation.")
     parser.add_argument("--no_cuda", action='store_true', help="Avoid using CUDA.")
     parser.add_argument('--seed', type=int, default=88, help="random seed for initialization.")
+    parser.add_argument(
+        "--bbox_as_input",
+        type=int, default=0,
+        help="where freeze the vision backbone or not"
+    )
     args = parser.parse_args()
 
     global logger
