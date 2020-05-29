@@ -136,7 +136,7 @@ class RetrievalDataset(Dataset):
             if type(self.labels[img_key]) == str:
                 od_labels = self.labels[img_key]
             else:
-                od_labels = ' '.join([l['class'] for l in self.labels[img_key]])
+                od_labels = ' '.join(self.labels[img_key]['class'])
             return od_labels
 
     def tensorize_example(self, text_a, img_feat, text_b=None, 
